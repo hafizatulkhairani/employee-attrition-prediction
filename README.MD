@@ -55,7 +55,7 @@ Membangun model klasifikasi Machine Learning yang mampu memprediksi apakah seora
 
 ## 📊 Dataset
 
-- **Sumber:** [Employee Attrition Prediction Dataset - Kaggle](https://www.kaggle.com/datasets/ziya07/employee-attrition-prediction-dataset)
+- **Sumber:** [IBM HR Analytics Employee Attrition & Performance - Kaggle](https://www.kaggle.com/datasets/pavansubhasht/ibm-hr-analytics-attrition-dataset?resource=download)
 - **Deskripsi:** Dataset berisi informasi karyawan beserta label attrition (resign/tidak)
 
 ---
