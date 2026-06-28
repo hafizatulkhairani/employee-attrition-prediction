@@ -1,3 +1,22 @@
+"""
+AttritionGuard - Employee Risk Prediction System
+Bagian Deployment (Streamlit)
+
+Fitur:
+  1. Prediksi Individu (input manual 1 karyawan)
+  2. Prediksi Batch (upload CSV banyak karyawan)
+  3. Dashboard Ringkasan EDA / Insight
+  4. Penjelasan SHAP / Feature Importance per prediksi
+  5. Prediksi Risiko Attrition + Rekomendasi Tindakan
+
+Catatan arsitektur:
+  - Praproses (encoding + feature engineering + scaling) DIREPLIKASI persis
+    dari notebook Data Preparation (Zahra) agar konsisten dengan model.
+  - Penyelarasan kolom memakai models/feature_columns.pkl dan kolom yang
+    di-scale diambil dari scaler.feature_names_in_ -> robust terhadap
+    perbedaan kategori one-hot.
+"""
+
 import os
 import io
 import joblib
@@ -13,7 +32,9 @@ try:
 except Exception:
     SHAP_AVAILABLE = False
 
+# ----------------------------------------------------------------------------
 # Konfigurasi halaman
+# ----------------------------------------------------------------------------
 st.set_page_config(
     page_title="AttritionGuard - Prediksi Risiko Attrition",
     page_icon="\U0001F6E1\uFE0F",
@@ -21,14 +42,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ----------------------------------------------------------------------------
 # Lokasi file (relatif terhadap struktur repo)
+# ----------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 TARGET_COL = "Attrition"
-# Kolom yang dibuang saat cleaning
+# Kolom yang dibuang saat cleaning (notebook cell 3.3)
 DROP_COLS = ["EmployeeNumber", "EmployeeCount", "Over18", "StandardHours"]
+
 
 def _find_file(candidates, folders):
     for folder in folders:
@@ -41,7 +65,10 @@ def _find_file(candidates, folders):
         # fallback: pola nama
     return None
 
+
+# ----------------------------------------------------------------------------
 # Loader artefak model
+# ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
     art = {"model": None, "scaler": None, "feature_columns": None,
@@ -110,7 +137,7 @@ def load_reference_data():
         "employee_attrition_dataset_10000.csv",
         "employee_attrition_clean.csv",
     ]
-    # Mengumpulkan kandidat: nama preferensi selanjutnya csv lain di folder data
+    # kumpulkan kandidat: nama preferensi dulu, lalu csv lain di folder data
     paths = []
     for name in preferred:
         p = _find_file([name], [DATA_DIR, BASE_DIR])
@@ -122,7 +149,7 @@ def load_reference_data():
                 p = os.path.join(DATA_DIR, n)
                 if p not in paths:
                     paths.append(p)
-    # Memilih data yang benar-benar mentah terlebih dahulu
+    # pilih yang benar-benar mentah lebih dulu
     fallback = None
     for p in paths:
         try:
@@ -162,7 +189,9 @@ def build_schema(_ref_df):
     }
 
 
+# ----------------------------------------------------------------------------
 # Praproses: replikasi pipeline notebook
+# ----------------------------------------------------------------------------
 def engineer_features(df):
     df = df.copy()
     if {"MonthlyIncome", "TotalWorkingYears"}.issubset(df.columns):
@@ -235,7 +264,9 @@ def risk_band(prob):
     return "Tinggi", "#e74c3c"
 
 
+# ----------------------------------------------------------------------------
 # Rekomendasi tindakan (rule-based dari insight EDA)
+# ----------------------------------------------------------------------------
 def build_recommendations(row, ref_df):
     recs = []
     def med(col):
@@ -280,7 +311,57 @@ def build_recommendations(row, ref_df):
     return recs
 
 
+# ----------------------------------------------------------------------------
+# Fitur penting untuk form ringkas (Prediksi Individu)
+# Dipilih berdasarkan Ringkasan Insight EDA (10 faktor utama attrition).
+# Kolom lain tetap dikirim ke model, tapi diisi otomatis dgn median/mode.
+# ----------------------------------------------------------------------------
+KEY_INPUT_COLS = [
+    "OverTime", "JobLevel", "JobRole", "MonthlyIncome", "MaritalStatus",
+    "Department", "JobSatisfaction", "BusinessTravel", "TotalWorkingYears", "Age",
+]
+
+
+def default_inputs(schema, ref_df):
+    """Nilai default (median utk numerik, mode utk kategorikal) utk semua raw_columns."""
+    defaults = {}
+    for col in schema["raw_columns"]:
+        series = ref_df[col].dropna()
+        if col in schema["cat_cols"]:
+            defaults[col] = str(series.mode().iloc[0]) if not series.empty else ""
+        else:
+            is_int = pd.api.types.is_integer_dtype(ref_df[col])
+            val = series.median() if not series.empty else 0
+            defaults[col] = int(val) if is_int else float(val)
+    return defaults
+
+
+def sample_row(ref_df, schema, risk="random"):
+    """Ambil satu baris contoh dari dataset referensi untuk mengisi form otomatis.
+    risk: 'high' (cenderung berisiko), 'low' (cenderung aman), atau 'random'."""
+    df = ref_df.copy()
+    if risk == "high" and "OverTime" in df.columns:
+        mask = df["OverTime"].astype(str).str.lower().isin(["yes", "1", "true"])
+        pool = df[mask] if mask.any() else df
+    elif risk == "low" and "OverTime" in df.columns:
+        mask = ~df["OverTime"].astype(str).str.lower().isin(["yes", "1", "true"])
+        pool = df[mask] if mask.any() else df
+    else:
+        pool = df
+    row = pool.sample(1).iloc[0]
+    result = {}
+    for col in schema["raw_columns"]:
+        if col in schema["cat_cols"]:
+            result[col] = str(row[col])
+        else:
+            is_int = pd.api.types.is_integer_dtype(ref_df[col])
+            result[col] = int(row[col]) if is_int else float(row[col])
+    return result
+
+
+# ----------------------------------------------------------------------------
 # Komponen UI
+# ----------------------------------------------------------------------------
 def gauge_chart(prob):
     band, color = risk_band(prob)
     fig = go.Figure(go.Indicator(
@@ -340,7 +421,9 @@ def plot_contrib(expl_df, mode):
     return fig
 
 
+# ============================================================================
 # APLIKASI
+# ============================================================================
 art = load_artifacts()
 ref_df = load_reference_data()
 schema = build_schema(ref_df) if ref_df is not None else None
@@ -370,7 +453,9 @@ with st.sidebar.expander("Status Sistem", expanded=False):
 MODEL_READY = art["model"] is not None and schema is not None
 
 
+# ----------------------------------------------------------------------------
 # HALAMAN: BERANDA
+# ----------------------------------------------------------------------------
 if page.endswith("Beranda"):
     st.title("\U0001F6E1\uFE0F AttritionGuard")
     st.subheader("Sistem Prediksi Risiko Attrition Karyawan")
@@ -401,33 +486,71 @@ if page.endswith("Beranda"):
         )
 
 
+# ----------------------------------------------------------------------------
 # HALAMAN: PREDIKSI INDIVIDU
+# ----------------------------------------------------------------------------
 elif page.endswith("Prediksi Individu"):
     st.title("\U0001F464 Prediksi Individu")
-    st.caption("Masukkan data 1 karyawan untuk memprediksi risiko attrition.")
+    st.caption("Masukkan data 1 karyawan untuk memprediksi risiko attrition. "
+               "Hanya 10 faktor paling berpengaruh (hasil EDA) yang perlu diisi manual; "
+               "faktor lain otomatis terisi nilai tipikal dari dataset.")
 
     if not MODEL_READY:
         st.error("Model atau dataset referensi belum tersedia. Lihat panel Status Sistem.")
         st.stop()
 
     raw_cols = schema["raw_columns"]
-    inputs = {}
+
+    # --- Tombol contoh cepat (untuk demo) ---
+    st.markdown("**Isi cepat dengan contoh dari dataset:**")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("\U0001F534 Contoh Risiko Tinggi", use_container_width=True):
+        st.session_state["form_values"] = sample_row(ref_df, schema, risk="high")
+    if c2.button("\U0001F7E2 Contoh Risiko Rendah", use_container_width=True):
+        st.session_state["form_values"] = sample_row(ref_df, schema, risk="low")
+    if c3.button("\U0001F3B2 Acak dari Dataset", use_container_width=True):
+        st.session_state["form_values"] = sample_row(ref_df, schema, risk="random")
+
+    base_values = st.session_state.get("form_values") or default_inputs(schema, ref_df)
+
+    inputs = dict(base_values)  # mulai dari default/contoh; field kunci akan ditimpa input user
     with st.form("form_individu"):
+        st.caption("\U0001F511 10 faktor utama (Insight EDA)")
+        key_cols = [c for c in KEY_INPUT_COLS if c in raw_cols]
         cols = st.columns(3)
-        for i, col in enumerate(raw_cols):
+        for i, col in enumerate(key_cols):
             target = cols[i % 3]
             if col in schema["cat_cols"]:
                 opts = sorted([str(x) for x in ref_df[col].dropna().unique()])
-                inputs[col] = target.selectbox(col, opts)
+                default_idx = opts.index(str(base_values[col])) if str(base_values[col]) in opts else 0
+                inputs[col] = target.selectbox(col, opts, index=default_idx)
             else:
                 series = ref_df[col].dropna()
                 vmin, vmax = float(series.min()), float(series.max())
-                vmed = float(series.median())
                 is_int = pd.api.types.is_integer_dtype(ref_df[col])
                 step = 1.0 if is_int else max((vmax - vmin) / 100, 0.01)
                 val = target.number_input(col, min_value=vmin, max_value=vmax,
-                                          value=vmed, step=step)
+                                          value=float(base_values[col]), step=step)
                 inputs[col] = int(val) if is_int else val
+
+        with st.expander("\u2699\ufe0f Faktor lain (opsional — terisi otomatis, bisa disesuaikan)"):
+            other_cols = [c for c in raw_cols if c not in KEY_INPUT_COLS]
+            cols2 = st.columns(3)
+            for i, col in enumerate(other_cols):
+                target = cols2[i % 3]
+                if col in schema["cat_cols"]:
+                    opts = sorted([str(x) for x in ref_df[col].dropna().unique()])
+                    default_idx = opts.index(str(base_values[col])) if str(base_values[col]) in opts else 0
+                    inputs[col] = target.selectbox(col, opts, index=default_idx, key=f"other_{col}")
+                else:
+                    series = ref_df[col].dropna()
+                    vmin, vmax = float(series.min()), float(series.max())
+                    is_int = pd.api.types.is_integer_dtype(ref_df[col])
+                    step = 1.0 if is_int else max((vmax - vmin) / 100, 0.01)
+                    val = target.number_input(col, min_value=vmin, max_value=vmax,
+                                              value=float(base_values[col]), step=step, key=f"other_{col}")
+                    inputs[col] = int(val) if is_int else val
+
         submitted = st.form_submit_button("\U0001F50D Prediksi", use_container_width=True)
 
     if submitted:
@@ -465,7 +588,9 @@ elif page.endswith("Prediksi Individu"):
                 st.markdown(f"**{faktor}**  \n{aksi}")
 
 
+# ----------------------------------------------------------------------------
 # HALAMAN: PREDIKSI BATCH
+# ----------------------------------------------------------------------------
 elif page.endswith("Prediksi Batch"):
     st.title("\U0001F4C1 Prediksi Batch")
     st.caption("Upload file CSV berisi banyak karyawan untuk prediksi sekaligus.")
@@ -530,7 +655,9 @@ elif page.endswith("Prediksi Batch"):
             )
 
 
+# ----------------------------------------------------------------------------
 # HALAMAN: DASHBOARD EDA
+# ----------------------------------------------------------------------------
 elif page.endswith("Dashboard EDA"):
     st.title("\U0001F4CA Dashboard Ringkasan EDA & Insight")
     if ref_df is None:
@@ -601,3 +728,28 @@ elif page.endswith("Dashboard EDA"):
         "4. **Review kompensasi** untuk menutup gap gaji.\n"
         "5. **Engagement untuk karyawan muda/single**."
     )
+
+
+# ----------------------------------------------------------------------------
+# HALAMAN: TENTANG
+# ----------------------------------------------------------------------------
+else:
+    st.title("\u2139\uFE0F Tentang AttritionGuard")
+    st.markdown(
+        """
+**AttritionGuard** adalah sistem prediksi risiko attrition karyawan berbasis Machine Learning,
+dibangun untuk **GWE 2026 Data Science Challenge**.
+
+**Pipeline:**
+1. Data Preparation \u2192 cleaning, encoding, feature engineering, scaling
+2. EDA \u2192 analisis faktor pendorong attrition
+3. Machine Learning \u2192 Logistic Regression, Decision Tree, Random Forest, XGBoost + SMOTE
+4. **Deployment (halaman ini)** \u2192 Streamlit
+
+**Fitur deployment:** prediksi individu, prediksi batch, dashboard EDA,
+penjelasan SHAP per prediksi, serta rekomendasi tindakan.
+
+**Tech stack:** Python, scikit-learn, XGBoost, SHAP, Pandas, Plotly, Streamlit.
+"""
+    )
+    st.caption("GWE 2026 Data Science Challenge | Grow With EDM Gen 7")
