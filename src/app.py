@@ -1,20 +1,12 @@
 """
-AttritionGuard - Employee Risk Prediction System
-Bagian Deployment (Streamlit)
+AttritionGuard — Sistem Prediksi Risiko Attrition Karyawan
+============================================================
+Dikerjakan oleh: Nabila Nur Aini (Deployment)
+Model & artefak dihasilkan oleh tahap Machine Learning (Hafizatul Khairani)
+Pipeline preprocessing mereplikasi notebook Data Preparation (Zahra Daniah)
 
-Fitur:
-  1. Prediksi Individu (input manual 1 karyawan)
-  2. Prediksi Batch (upload CSV banyak karyawan)
-  3. Dashboard Ringkasan EDA / Insight
-  4. Penjelasan SHAP / Feature Importance per prediksi
-  5. Prediksi Risiko Attrition + Rekomendasi Tindakan
-
-Catatan arsitektur:
-  - Praproses (encoding + feature engineering + scaling) DIREPLIKASI persis
-    dari notebook Data Preparation (Zahra) agar konsisten dengan model.
-  - Penyelarasan kolom memakai models/feature_columns.pkl dan kolom yang
-    di-scale diambil dari scaler.feature_names_in_ -> robust terhadap
-    perbedaan kategori one-hot.
+Jalankan dengan:
+    streamlit run app.py
 """
 
 import os
@@ -32,19 +24,27 @@ try:
 except Exception:
     SHAP_AVAILABLE = False
 
-# ----------------------------------------------------------------------------
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
+
 # Konfigurasi halaman
-# ----------------------------------------------------------------------------
 st.set_page_config(
     page_title="AttritionGuard - Prediksi Risiko Attrition",
-    page_icon="\U0001F6E1\uFE0F",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ----------------------------------------------------------------------------
-# Lokasi file (relatif terhadap struktur repo)
-# ----------------------------------------------------------------------------
+# ============================================================
+# 1.2 Lokasi File & Loader Artefak Model
+# ============================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -62,13 +62,9 @@ def _find_file(candidates, folders):
             p = os.path.join(folder, name)
             if os.path.exists(p):
                 return p
-        # fallback: pola nama
     return None
 
 
-# ----------------------------------------------------------------------------
-# Loader artefak model
-# ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
     art = {"model": None, "scaler": None, "feature_columns": None,
@@ -116,6 +112,9 @@ def load_artifacts():
     return art
 
 
+# ============================================================
+# 1.3 Loader Dataset Referensi & Schema Encoding
+# ============================================================
 def _looks_raw(df):
     """True jika dataframe masih mentah (punya kolom kategorikal asli, belum di-encode)."""
     if df is None:
@@ -137,7 +136,6 @@ def load_reference_data():
         "employee_attrition_dataset_10000.csv",
         "employee_attrition_clean.csv",
     ]
-    # kumpulkan kandidat: nama preferensi dulu, lalu csv lain di folder data
     paths = []
     for name in preferred:
         p = _find_file([name], [DATA_DIR, BASE_DIR])
@@ -149,7 +147,6 @@ def load_reference_data():
                 p = os.path.join(DATA_DIR, n)
                 if p not in paths:
                     paths.append(p)
-    # pilih yang benar-benar mentah lebih dulu
     fallback = None
     for p in paths:
         try:
@@ -189,9 +186,9 @@ def build_schema(_ref_df):
     }
 
 
-# ----------------------------------------------------------------------------
-# Praproses: replikasi pipeline notebook
-# ----------------------------------------------------------------------------
+# ============================================================
+# 2.1 Praproses — Replikasi Pipeline Notebook Data Preparation
+# ============================================================
 def engineer_features(df):
     df = df.copy()
     if {"MonthlyIncome", "TotalWorkingYears"}.issubset(df.columns):
@@ -249,6 +246,9 @@ def preprocess(raw_df, schema, feature_columns, scaler):
     return df
 
 
+# ============================================================
+# 2.2 Fungsi Prediksi & Kategori Risiko
+# ============================================================
 def predict_proba(model, X):
     if hasattr(model, "predict_proba"):
         return model.predict_proba(X)[:, 1]
@@ -264,9 +264,9 @@ def risk_band(prob):
     return "Tinggi", "#e74c3c"
 
 
-# ----------------------------------------------------------------------------
-# Rekomendasi tindakan (rule-based dari insight EDA)
-# ----------------------------------------------------------------------------
+# ============================================================
+# 2.3 Rekomendasi Tindakan (Rule-Based dari Insight EDA)
+# ============================================================
 def build_recommendations(row, ref_df):
     recs = []
     def med(col):
@@ -311,64 +311,16 @@ def build_recommendations(row, ref_df):
     return recs
 
 
-# ----------------------------------------------------------------------------
-# Fitur penting untuk form ringkas (Prediksi Individu)
-# Dipilih berdasarkan Ringkasan Insight EDA (10 faktor utama attrition).
-# Kolom lain tetap dikirim ke model, tapi diisi otomatis dgn median/mode.
-# ----------------------------------------------------------------------------
-KEY_INPUT_COLS = [
-    "OverTime", "JobLevel", "JobRole", "MonthlyIncome", "MaritalStatus",
-    "Department", "JobSatisfaction", "BusinessTravel", "TotalWorkingYears", "Age",
-]
-
-
-def default_inputs(schema, ref_df):
-    """Nilai default (median utk numerik, mode utk kategorikal) utk semua raw_columns."""
-    defaults = {}
-    for col in schema["raw_columns"]:
-        series = ref_df[col].dropna()
-        if col in schema["cat_cols"]:
-            defaults[col] = str(series.mode().iloc[0]) if not series.empty else ""
-        else:
-            is_int = pd.api.types.is_integer_dtype(ref_df[col])
-            val = series.median() if not series.empty else 0
-            defaults[col] = int(val) if is_int else float(val)
-    return defaults
-
-
-def sample_row(ref_df, schema, risk="random"):
-    """Ambil satu baris contoh dari dataset referensi untuk mengisi form otomatis.
-    risk: 'high' (cenderung berisiko), 'low' (cenderung aman), atau 'random'."""
-    df = ref_df.copy()
-    if risk == "high" and "OverTime" in df.columns:
-        mask = df["OverTime"].astype(str).str.lower().isin(["yes", "1", "true"])
-        pool = df[mask] if mask.any() else df
-    elif risk == "low" and "OverTime" in df.columns:
-        mask = ~df["OverTime"].astype(str).str.lower().isin(["yes", "1", "true"])
-        pool = df[mask] if mask.any() else df
-    else:
-        pool = df
-    row = pool.sample(1).iloc[0]
-    result = {}
-    for col in schema["raw_columns"]:
-        if col in schema["cat_cols"]:
-            result[col] = str(row[col])
-        else:
-            is_int = pd.api.types.is_integer_dtype(ref_df[col])
-            result[col] = int(row[col]) if is_int else float(row[col])
-    return result
-
-
-# ----------------------------------------------------------------------------
-# Komponen UI
-# ----------------------------------------------------------------------------
+# ============================================================
+# 2.4 Komponen UI — Gauge Chart & Penjelasan Kontribusi Fitur
+# ============================================================
 def gauge_chart(prob):
     band, color = risk_band(prob)
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=prob * 100,
         number={"suffix": "%", "font": {"size": 40}},
-        title={"text": f"Probabilitas Resign &mdash; Risiko {band}"},
+        title={"text": f"Probabilitas Resign — Risiko {band}"},
         gauge={
             "axis": {"range": [0, 100]},
             "bar": {"color": color},
@@ -383,9 +335,37 @@ def gauge_chart(prob):
     return fig
 
 
-def shap_explanation(model, X_row, feature_columns, top_n=10):
-    """Hitung kontribusi fitur untuk 1 prediksi. Return DataFrame (fitur, shap)."""
-    if SHAP_AVAILABLE:
+def shap_explanation(model, X_row, feature_columns, X_background=None, top_n=10):
+    """Hitung kontribusi fitur untuk 1 prediksi. Return (DataFrame[Fitur, Kontribusi], mode).
+
+    Mendukung:
+    - Model tree-based (RandomForest, DecisionTree, XGBoost) -> shap.TreeExplainer
+    - Logistic Regression / model linear -> shap.LinearExplainer, fallback ke kontribusi
+      manual (koefisien * nilai fitur ternormalisasi), karena TreeExplainer tidak berlaku
+      untuk model linear.
+    """
+    # --- Model linear (Logistic Regression dkk) ---
+    if isinstance(model, LogisticRegression):
+        if SHAP_AVAILABLE and X_background is not None:
+            try:
+                explainer = shap.LinearExplainer(model, X_background)
+                sv = np.array(explainer.shap_values(X_row), dtype=float).reshape(-1)
+                out = pd.DataFrame({"Fitur": feature_columns, "Kontribusi": sv})
+                out["abs"] = out["Kontribusi"].abs()
+                return out.sort_values("abs", ascending=False).head(top_n), "shap"
+            except Exception:
+                pass
+        # Fallback: kontribusi = koefisien * nilai fitur (sudah ter-scaling)
+        coef = np.asarray(model.coef_).reshape(-1)
+        x = np.asarray(X_row).reshape(-1)
+        contrib = coef * x
+        out = pd.DataFrame({"Fitur": feature_columns, "Kontribusi": contrib})
+        out["abs"] = out["Kontribusi"].abs()
+        return out.sort_values("abs", ascending=False).head(top_n), "linear_contrib"
+
+    # --- Model tree-based ---
+    if SHAP_AVAILABLE and isinstance(model, (RandomForestClassifier, DecisionTreeClassifier)) or \
+       (XGB_AVAILABLE and isinstance(model, xgb.XGBClassifier)):
         try:
             explainer = shap.TreeExplainer(model)
             sv = explainer.shap_values(X_row)
@@ -397,7 +377,8 @@ def shap_explanation(model, X_row, feature_columns, top_n=10):
             return out.sort_values("abs", ascending=False).head(top_n), "shap"
         except Exception:
             pass
-    # Fallback: feature importance global
+
+    # --- Fallback umum: feature importance global ---
     imp = getattr(model, "feature_importances_", None)
     if imp is not None:
         out = pd.DataFrame({"Fitur": feature_columns, "Kontribusi": np.array(imp, dtype=float)})
@@ -414,50 +395,64 @@ def plot_contrib(expl_df, mode):
         orientation="h",
         marker_color=colors[::-1],
     ))
-    title = ("Kontribusi Fitur terhadap Prediksi (SHAP)" if mode == "shap"
-             else "Feature Importance (global)")
-    fig.update_layout(title=title, height=420, margin=dict(t=50, b=20, l=10, r=10),
-                      xaxis_title="Dampak ke arah Resign (+) / Stay (-)")
+    title_map = {
+        "shap": "Kontribusi Fitur terhadap Prediksi (SHAP)",
+        "linear_contrib": "Kontribusi Fitur terhadap Prediksi (Koefisien × Nilai)",
+        "importance": "Feature Importance (global)",
+    }
+    fig.update_layout(
+        title=title_map.get(mode, "Kontribusi Fitur"),
+        height=420, margin=dict(t=50, b=20, l=10, r=10),
+        xaxis_title="Dampak ke arah Resign (+) / Stay (-)",
+    )
     return fig
 
 
-# ============================================================================
-# APLIKASI
-# ============================================================================
+# ============================================================
+# 3.1 Inisialisasi Aplikasi & Sidebar Navigasi
+# ============================================================
 art = load_artifacts()
 ref_df = load_reference_data()
 schema = build_schema(ref_df) if ref_df is not None else None
 
-st.sidebar.title("\U0001F6E1\uFE0F AttritionGuard")
+st.sidebar.title("🛡️ AttritionGuard")
 st.sidebar.caption("Employee Risk Prediction System")
 page = st.sidebar.radio(
     "Navigasi",
-    ["\U0001F3E0 Beranda",
-     "\U0001F464 Prediksi Individu",
-     "\U0001F4C1 Prediksi Batch",
-     "\U0001F4CA Dashboard EDA",
-     "\u2139\uFE0F Tentang"],
+    ["🏠 Beranda",
+     "👤 Prediksi Individu",
+     "📁 Prediksi Batch",
+     "📊 Dashboard EDA",
+     "ℹ️ Tentang"],
 )
 
 # Status artefak
 with st.sidebar.expander("Status Sistem", expanded=False):
-    st.write("Model:", "\u2705" if art["model"] is not None else "\u274C")
-    st.write("Scaler:", "\u2705" if art["scaler"] is not None else "\u274C")
-    st.write("Feature columns:", "\u2705" if art["feature_columns"] is not None else "\u274C")
-    st.write("Dataset EDA:", "\u2705" if ref_df is not None else "\u274C")
-    st.write("SHAP:", "\u2705" if SHAP_AVAILABLE else "\u274C (pakai importance)")
+    st.write("Model:", "✅" if art["model"] is not None else "❌")
+    st.write("Scaler:", "✅" if art["scaler"] is not None else "❌")
+    st.write("Feature columns:", "✅" if art["feature_columns"] is not None else "❌")
+    st.write("Dataset EDA:", "✅" if ref_df is not None else "❌")
+    st.write("SHAP:", "✅" if SHAP_AVAILABLE else "❌ (pakai kontribusi koefisien)")
     st.write(f"Threshold: {art['threshold']:.2f}")
     for e in art["errors"]:
         st.warning(e)
 
 MODEL_READY = art["model"] is not None and schema is not None
 
+# Cache ringan untuk background data SHAP LinearExplainer (sample dari data referensi)
+@st.cache_data(show_spinner=False)
+def get_background_matrix(_ref_df, _schema, _feature_columns, _scaler, n=100):
+    if _ref_df is None or _schema is None:
+        return None
+    sample = _ref_df.sample(min(n, len(_ref_df)), random_state=42)
+    return preprocess(sample, _schema, _feature_columns, _scaler).values
 
-# ----------------------------------------------------------------------------
-# HALAMAN: BERANDA
-# ----------------------------------------------------------------------------
+
+# ============================================================
+# 3.2 Halaman: Beranda
+# ============================================================
 if page.endswith("Beranda"):
-    st.title("\U0001F6E1\uFE0F AttritionGuard")
+    st.title("🛡️ AttritionGuard")
     st.subheader("Sistem Prediksi Risiko Attrition Karyawan")
     st.markdown(
         "AttritionGuard membantu perusahaan mengidentifikasi karyawan yang berpotensi "
@@ -475,9 +470,9 @@ if page.endswith("Beranda"):
     st.divider()
     st.markdown("#### Fitur Utama")
     f1, f2, f3 = st.columns(3)
-    f1.info("**\U0001F464 Prediksi Individu**\n\nInput manual 1 karyawan + gauge risiko, penjelasan SHAP, dan rekomendasi.")
-    f2.info("**\U0001F4C1 Prediksi Batch**\n\nUpload CSV banyak karyawan, ranking risiko, dan unduh hasil.")
-    f3.info("**\U0001F4CA Dashboard EDA**\n\nRingkasan insight & faktor pendorong attrition.")
+    f1.info("**👤 Prediksi Individu**\n\nInput manual 1 karyawan + gauge risiko, penjelasan kontribusi fitur, dan rekomendasi.")
+    f2.info("**📁 Prediksi Batch**\n\nUpload CSV banyak karyawan, ranking risiko, dan unduh hasil.")
+    f3.info("**📊 Dashboard EDA**\n\nRingkasan insight & faktor pendorong attrition.")
     if not MODEL_READY:
         st.warning(
             "Model belum lengkap. Pastikan file berikut ada di folder **models/**: "
@@ -485,271 +480,366 @@ if page.endswith("Beranda"):
             "dan dataset mentah di folder **data/**."
         )
 
-
-# ----------------------------------------------------------------------------
-# HALAMAN: PREDIKSI INDIVIDU
-# ----------------------------------------------------------------------------
+# ============================================================
+# 3.3 Halaman: Prediksi Individu
+# ============================================================
 elif page.endswith("Prediksi Individu"):
-    st.title("\U0001F464 Prediksi Individu")
-    st.caption("Masukkan data 1 karyawan untuk memprediksi risiko attrition. "
-               "Hanya 10 faktor paling berpengaruh (hasil EDA) yang perlu diisi manual; "
-               "faktor lain otomatis terisi nilai tipikal dari dataset.")
+    st.title("👤 Prediksi Individu")
+    st.markdown("Masukkan data satu karyawan untuk melihat probabilitas risiko resign beserta penjelasannya.")
 
     if not MODEL_READY:
-        st.error("Model atau dataset referensi belum tersedia. Lihat panel Status Sistem.")
-        st.stop()
+        st.error("Model belum siap. Periksa status sistem di sidebar.")
+    else:
+        raw_cols = schema["raw_columns"]
+        with st.form("form_individu"):
+            st.markdown("#### Data Karyawan")
+            cols_layout = st.columns(3)
+            input_data = {}
 
-    raw_cols = schema["raw_columns"]
+            # Kolom numerik
+            for i, col in enumerate(schema["num_cols"]):
+                default = float(ref_df[col].median()) if ref_df is not None else 0.0
+                lo = float(ref_df[col].min()) if ref_df is not None else 0.0
+                hi = float(ref_df[col].max()) if ref_df is not None else default * 2 + 1
+                with cols_layout[i % 3]:
+                    input_data[col] = st.number_input(
+                        col, value=default, min_value=lo, max_value=hi, step=1.0
+                    )
 
-    # --- Tombol contoh cepat (untuk demo) ---
-    st.markdown("**Isi cepat dengan contoh dari dataset:**")
-    c1, c2, c3 = st.columns(3)
-    if c1.button("\U0001F534 Contoh Risiko Tinggi", use_container_width=True):
-        st.session_state["form_values"] = sample_row(ref_df, schema, risk="high")
-    if c2.button("\U0001F7E2 Contoh Risiko Rendah", use_container_width=True):
-        st.session_state["form_values"] = sample_row(ref_df, schema, risk="low")
-    if c3.button("\U0001F3B2 Acak dari Dataset", use_container_width=True):
-        st.session_state["form_values"] = sample_row(ref_df, schema, risk="random")
+            # Kolom binary
+            for i, col in enumerate(schema["binary_cols"]):
+                options = list(schema["binary_maps"][col].keys())
+                with cols_layout[i % 3]:
+                    input_data[col] = st.selectbox(col, options)
 
-    base_values = st.session_state.get("form_values") or default_inputs(schema, ref_df)
+            # Kolom one-hot (kategorikal multi-nilai)
+            for i, col in enumerate(schema["onehot_cols"]):
+                options = sorted(ref_df[col].dropna().unique().tolist()) if ref_df is not None else []
+                with cols_layout[i % 3]:
+                    input_data[col] = st.selectbox(col, options)
 
-    inputs = dict(base_values)  # mulai dari default/contoh; field kunci akan ditimpa input user
-    with st.form("form_individu"):
-        st.caption("\U0001F511 10 faktor utama (Insight EDA)")
-        key_cols = [c for c in KEY_INPUT_COLS if c in raw_cols]
-        cols = st.columns(3)
-        for i, col in enumerate(key_cols):
-            target = cols[i % 3]
-            if col in schema["cat_cols"]:
-                opts = sorted([str(x) for x in ref_df[col].dropna().unique()])
-                default_idx = opts.index(str(base_values[col])) if str(base_values[col]) in opts else 0
-                inputs[col] = target.selectbox(col, opts, index=default_idx)
-            else:
-                series = ref_df[col].dropna()
-                vmin, vmax = float(series.min()), float(series.max())
-                is_int = pd.api.types.is_integer_dtype(ref_df[col])
-                step = 1.0 if is_int else max((vmax - vmin) / 100, 0.01)
-                val = target.number_input(col, min_value=vmin, max_value=vmax,
-                                          value=float(base_values[col]), step=step)
-                inputs[col] = int(val) if is_int else val
+            submitted = st.form_submit_button("🔍 Prediksi Risiko", use_container_width=True)
 
-        with st.expander("\u2699\ufe0f Faktor lain (opsional — terisi otomatis, bisa disesuaikan)"):
-            other_cols = [c for c in raw_cols if c not in KEY_INPUT_COLS]
-            cols2 = st.columns(3)
-            for i, col in enumerate(other_cols):
-                target = cols2[i % 3]
-                if col in schema["cat_cols"]:
-                    opts = sorted([str(x) for x in ref_df[col].dropna().unique()])
-                    default_idx = opts.index(str(base_values[col])) if str(base_values[col]) in opts else 0
-                    inputs[col] = target.selectbox(col, opts, index=default_idx, key=f"other_{col}")
+        if submitted:
+            input_df = pd.DataFrame([input_data])
+            X_processed = preprocess(input_df, schema, art["feature_columns"], art["scaler"])
+            prob = float(predict_proba(art["model"], X_processed)[0])
+            band, color = risk_band(prob)
+
+            st.divider()
+            res_col1, res_col2 = st.columns([1, 1])
+
+            with res_col1:
+                st.plotly_chart(gauge_chart(prob), use_container_width=True)
+                pred_label = "Berisiko Resign" if prob >= art["threshold"] else "Cenderung Stay"
+                st.markdown(
+                    f"**Prediksi (threshold {art['threshold']:.2f}):** "
+                    f":{'red' if prob >= art['threshold'] else 'green'}[{pred_label}]"
+                )
+
+            with res_col2:
+                st.markdown("#### Kontribusi Fitur terhadap Prediksi")
+                background = get_background_matrix(ref_df, schema, art["feature_columns"], art["scaler"])
+                expl_df, mode = shap_explanation(
+                    art["model"], X_processed.values, art["feature_columns"],
+                    X_background=background, top_n=10
+                )
+                if expl_df is not None:
+                    st.plotly_chart(plot_contrib(expl_df, mode), use_container_width=True)
                 else:
-                    series = ref_df[col].dropna()
-                    vmin, vmax = float(series.min()), float(series.max())
-                    is_int = pd.api.types.is_integer_dtype(ref_df[col])
-                    step = 1.0 if is_int else max((vmax - vmin) / 100, 0.01)
-                    val = target.number_input(col, min_value=vmin, max_value=vmax,
-                                              value=float(base_values[col]), step=step, key=f"other_{col}")
-                    inputs[col] = int(val) if is_int else val
+                    st.info("Penjelasan kontribusi fitur tidak tersedia untuk model ini.")
 
-        submitted = st.form_submit_button("\U0001F50D Prediksi", use_container_width=True)
+            st.divider()
+            st.markdown("#### Rekomendasi Tindakan untuk HR")
+            recs = build_recommendations(input_data, ref_df)
+            for judul, saran in recs:
+                st.warning(f"**{judul}** — {saran}")
 
-    if submitted:
-        raw_row = pd.DataFrame([inputs])
-        X = preprocess(raw_row, schema, art["feature_columns"], art["scaler"])
-        prob = float(predict_proba(art["model"], X)[0])
-        band, color = risk_band(prob)
-        pred_label = "BERISIKO RESIGN" if prob >= art["threshold"] else "CENDERUNG BERTAHAN"
-
-        st.divider()
-        left, right = st.columns([1, 1])
-        with left:
-            st.plotly_chart(gauge_chart(prob), use_container_width=True)
-        with right:
-            st.markdown(f"### Status: <span style='color:{color}'>{pred_label}</span>",
-                        unsafe_allow_html=True)
-            st.markdown(f"**Probabilitas resign:** {prob*100:.1f}%")
-            st.markdown(f"**Tingkat risiko:** :{ 'red' if band=='Tinggi' else ('orange' if band=='Sedang' else 'green')}[{band}]")
-            st.progress(min(prob, 1.0))
-
-        st.divider()
-        tab1, tab2 = st.tabs(["\U0001F9E0 Penjelasan (SHAP)", "\U0001F4A1 Rekomendasi Tindakan"])
-        with tab1:
-            expl, mode = shap_explanation(art["model"], X.values,
-                                          art["feature_columns"] or list(X.columns))
-            if expl is not None:
-                st.plotly_chart(plot_contrib(expl, mode), use_container_width=True)
-                st.caption("Merah = mendorong ke arah resign, Biru = menahan (cenderung bertahan)."
-                           if mode == "shap" else
-                           "Menampilkan feature importance global (SHAP tidak tersedia).")
-            else:
-                st.info("Penjelasan fitur tidak tersedia untuk model ini.")
-        with tab2:
-            for faktor, aksi in build_recommendations(inputs, ref_df):
-                st.markdown(f"**{faktor}**  \n{aksi}")
-
-
-# ----------------------------------------------------------------------------
-# HALAMAN: PREDIKSI BATCH
-# ----------------------------------------------------------------------------
+# ============================================================
+# 3.4 Halaman: Prediksi Batch
+# ============================================================
 elif page.endswith("Prediksi Batch"):
-    st.title("\U0001F4C1 Prediksi Batch")
-    st.caption("Upload file CSV berisi banyak karyawan untuk prediksi sekaligus.")
-
-    if not MODEL_READY:
-        st.error("Model atau dataset referensi belum tersedia. Lihat panel Status Sistem.")
-        st.stop()
-
-    # Template CSV
-    tmpl = ref_df.drop(columns=[c for c in [TARGET_COL] if c in ref_df.columns]).head(5)
-    st.download_button(
-        "\U0001F4C4 Unduh template CSV",
-        tmpl.to_csv(index=False).encode("utf-8"),
-        file_name="template_input_karyawan.csv",
-        mime="text/csv",
+    st.title("📁 Prediksi Batch")
+    st.markdown(
+        "Upload file CSV berisi data banyak karyawan (format kolom sama seperti dataset asli) "
+        "untuk memprediksi risiko resign sekaligus dan mengurutkan berdasarkan tingkat risiko."
     )
 
-    up = st.file_uploader("Upload CSV karyawan", type=["csv"])
-    if up is not None:
-        try:
-            data = pd.read_csv(up)
-        except Exception as e:
-            st.error(f"Gagal membaca CSV: {e}")
-            st.stop()
-        st.write(f"Jumlah baris: **{len(data)}**")
-        st.dataframe(data.head(), use_container_width=True)
-
-        if st.button("\U0001F680 Jalankan Prediksi Batch", use_container_width=True):
-            X = preprocess(data, schema, art["feature_columns"], art["scaler"])
-            probs = predict_proba(art["model"], X)
-            res = data.copy()
-            res["Prob_Resign"] = (probs * 100).round(1)
-            res["Prediksi"] = np.where(probs >= art["threshold"], "Berisiko Resign", "Bertahan")
-            res["Tingkat_Risiko"] = [risk_band(p)[0] for p in probs]
-            res = res.sort_values("Prob_Resign", ascending=False)
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total karyawan", len(res))
-            c2.metric("Berisiko resign", int((probs >= art["threshold"]).sum()))
-            c3.metric("Risiko tinggi", int(sum(risk_band(p)[0] == "Tinggi" for p in probs)))
-
-            dist = pd.Series([risk_band(p)[0] for p in probs]).value_counts()
-            fig = px.pie(values=dist.values, names=dist.index,
-                         color=dist.index,
-                         color_discrete_map={"Rendah": "#2ecc71", "Sedang": "#f39c12",
-                                             "Tinggi": "#e74c3c"},
-                         title="Distribusi Tingkat Risiko")
-            st.plotly_chart(fig, use_container_width=True)
-
-            def _hl(v):
-                c = {"Tinggi": "#fdedec", "Sedang": "#fef5e7", "Rendah": "#eafaf1"}.get(v, "")
-                return f"background-color: {c}"
-            st.dataframe(res.style.applymap(_hl, subset=["Tingkat_Risiko"]),
-                         use_container_width=True, height=420)
-
+    if not MODEL_READY:
+        st.error("Model belum siap. Periksa status sistem di sidebar.")
+    else:
+        if ref_df is not None:
+            template_csv = ref_df[schema["raw_columns"]].head(5).to_csv(index=False).encode("utf-8")
             st.download_button(
-                "\U0001F4BE Unduh hasil prediksi (CSV)",
-                res.to_csv(index=False).encode("utf-8"),
-                file_name="hasil_prediksi_attrition.csv",
+                "⬇️ Unduh Template CSV (contoh format)",
+                data=template_csv,
+                file_name="template_prediksi_batch.csv",
                 mime="text/csv",
-                use_container_width=True,
             )
 
+        uploaded = st.file_uploader("Upload file CSV", type=["csv"])
 
-# ----------------------------------------------------------------------------
-# HALAMAN: DASHBOARD EDA
-# ----------------------------------------------------------------------------
+        if uploaded is not None:
+            try:
+                batch_df = pd.read_csv(uploaded)
+            except Exception as e:
+                st.error(f"Gagal membaca file: {e}")
+                batch_df = None
+
+            if batch_df is not None:
+                missing_cols = [c for c in schema["raw_columns"] if c not in batch_df.columns]
+                if missing_cols:
+                    st.warning(f"Kolom berikut tidak ditemukan dan akan diisi nilai default: {missing_cols}")
+
+                with st.spinner("Memproses prediksi..."):
+                    X_batch = preprocess(batch_df, schema, art["feature_columns"], art["scaler"])
+                    probs = predict_proba(art["model"], X_batch.values)
+
+                result_df = batch_df.copy()
+                result_df["Probabilitas_Resign"] = (probs * 100).round(2)
+                result_df["Kategori_Risiko"] = [risk_band(p)[0] for p in probs]
+                result_df["Prediksi"] = np.where(
+                    probs >= art["threshold"], "Berisiko Resign", "Cenderung Stay"
+                )
+                result_df = result_df.sort_values("Probabilitas_Resign", ascending=False)
+
+                st.success(f"✅ Prediksi selesai untuk {len(result_df)} karyawan.")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Karyawan", f"{len(result_df):,}")
+                m2.metric("Risiko Tinggi", int((result_df["Kategori_Risiko"] == "Tinggi").sum()))
+                m3.metric("Risiko Sedang", int((result_df["Kategori_Risiko"] == "Sedang").sum()))
+
+                st.markdown("#### Ranking Risiko Karyawan")
+
+                def highlight_risk(val):
+                    color_map = {"Tinggi": "#fdedec", "Sedang": "#fef5e7", "Rendah": "#eafaf1"}
+                    return f"background-color: {color_map.get(val, '')}"
+
+                st.dataframe(
+                    result_df.style.applymap(highlight_risk, subset=["Kategori_Risiko"]),
+                    use_container_width=True,
+                    height=420,
+                )
+
+                csv_out = result_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Unduh Hasil Prediksi (CSV)",
+                    data=csv_out,
+                    file_name="hasil_prediksi_attrition.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+                st.divider()
+                fig_dist = px.histogram(
+                    result_df, x="Probabilitas_Resign", color="Kategori_Risiko",
+                    color_discrete_map={"Tinggi": "#e74c3c", "Sedang": "#f39c12", "Rendah": "#2ecc71"},
+                    nbins=20, title="Distribusi Probabilitas Resign — Seluruh Karyawan",
+                )
+                st.plotly_chart(fig_dist, use_container_width=True)
+
+# ============================================================
+# 3.5 Halaman: Dashboard EDA
+# ============================================================
 elif page.endswith("Dashboard EDA"):
-    st.title("\U0001F4CA Dashboard Ringkasan EDA & Insight")
+    st.title("Dashboard EDA")
+    st.markdown("Ringkasan temuan eksplorasi data dari tahap analisis (lihat notebook EDA untuk detail lengkap).")
+
     if ref_df is None:
-        st.error("Dataset tidak ditemukan di folder data/.")
-        st.stop()
-
-    df = ref_df.copy()
-    has_target = TARGET_COL in df.columns
-    if has_target:
-        df["_resign"] = df[TARGET_COL].astype(str).str.lower().isin(["yes", "1"]).astype(int)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total karyawan", f"{len(df):,}")
-    if has_target:
-        c2.metric("Tingkat attrition", f"{df['_resign'].mean()*100:.1f}%")
-        c3.metric("Jumlah resign", int(df["_resign"].sum()))
-
-    st.divider()
-
-    def rate_by(col):
-        g = df.groupby(col)["_resign"].mean().sort_values(ascending=False) * 100
-        return g
-
-    if has_target:
-        colA, colB = st.columns(2)
-        for col, container in [("OverTime", colA), ("MaritalStatus", colB),
-                               ("Department", colA), ("JobRole", colB),
-                               ("BusinessTravel", colA), ("JobLevel", colB)]:
-            if col in df.columns:
-                g = rate_by(col)
-                fig = px.bar(x=g.index.astype(str), y=g.values,
-                             labels={"x": col, "y": "Attrition Rate (%)"},
-                             title=f"Attrition berdasarkan {col}",
-                             color=g.values, color_continuous_scale="Reds")
-                container.plotly_chart(fig, use_container_width=True)
-
-        if "MonthlyIncome" in df.columns:
-            fig = px.box(df, x=TARGET_COL, y="MonthlyIncome", color=TARGET_COL,
-                         title="Distribusi Monthly Income: Resign vs Bertahan")
-            st.plotly_chart(fig, use_container_width=True)
+        st.error("Dataset referensi tidak ditemukan.")
     else:
-        st.info("Kolom target tidak ada pada dataset, menampilkan distribusi umum.")
-        num = df.select_dtypes(include=["int64", "float64"]).columns[:6]
-        for col in num:
-            st.plotly_chart(px.histogram(df, x=col, title=f"Distribusi {col}"),
-                            use_container_width=True)
+        df = ref_df.copy()
+        df["Attrition_Flag"] = df[TARGET_COL].astype(str).str.lower().isin(["yes", "1"]).astype(int)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Karyawan", f"{len(df):,}")
+        m2.metric("Tingkat Attrition", f"{df['Attrition_Flag'].mean()*100:.1f}%")
+        m3.metric("Rata-rata Usia", f"{df['Age'].mean():.1f} thn" if "Age" in df else "-")
+        m4.metric("Rata-rata Gaji", f"Rp{df['MonthlyIncome'].mean():,.0f}" if "MonthlyIncome" in df else "-")
+
+        st.divider()
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["Demografi", "Faktor Pekerjaan", "Kompensasi & Kepuasan", "Korelasi"]
+        )
+
+        with tab1:
+            c1, c2 = st.columns(2)
+            with c1:
+                if "Age" in df.columns:
+                    fig = px.histogram(
+                        df, x="Age", color=df["Attrition_Flag"].map({0: "Stay", 1: "Resign"}),
+                        nbins=20, barmode="overlay",
+                        color_discrete_map={"Stay": "#3498db", "Resign": "#e74c3c"},
+                        title="Distribusi Usia berdasarkan Status Attrition",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                if "Gender" in df.columns:
+                    rate = df.groupby("Gender")["Attrition_Flag"].mean().reset_index()
+                    rate["Attrition_Flag"] *= 100
+                    fig = px.bar(
+                        rate, x="Gender", y="Attrition_Flag",
+                        title="Tingkat Attrition berdasarkan Gender (%)",
+                        color_discrete_sequence=["#3498db"],
+                    )
+                    fig.update_layout(yaxis_title="Tingkat Attrition (%)")
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with tab2:
+            c1, c2 = st.columns(2)
+            with c1:
+                if "Department" in df.columns:
+                    rate = df.groupby("Department")["Attrition_Flag"].mean().reset_index()
+                    rate["Attrition_Flag"] *= 100
+                    fig = px.bar(
+                        rate.sort_values("Attrition_Flag", ascending=False),
+                        x="Department", y="Attrition_Flag",
+                        title="Tingkat Attrition per Departemen (%)",
+                        color_discrete_sequence=["#e74c3c"],
+                    )
+                    fig.update_layout(yaxis_title="Tingkat Attrition (%)")
+                    st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                if "OverTime" in df.columns:
+                    rate = df.groupby("OverTime")["Attrition_Flag"].mean().reset_index()
+                    rate["Attrition_Flag"] *= 100
+                    fig = px.bar(
+                        rate, x="OverTime", y="Attrition_Flag",
+                        title="Tingkat Attrition: OverTime vs Tidak (%)",
+                        color_discrete_sequence=["#f39c12"],
+                    )
+                    fig.update_layout(yaxis_title="Tingkat Attrition (%)")
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with tab3:
+            c1, c2 = st.columns(2)
+            with c1:
+                if "MonthlyIncome" in df.columns:
+                    fig = px.box(
+                        df, x=df["Attrition_Flag"].map({0: "Stay", 1: "Resign"}), y="MonthlyIncome",
+                        title="Monthly Income berdasarkan Status Attrition",
+                        color=df["Attrition_Flag"].map({0: "Stay", 1: "Resign"}),
+                        color_discrete_map={"Stay": "#3498db", "Resign": "#e74c3c"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                sat_cols = [c for c in ["JobSatisfaction", "EnvironmentSatisfaction",
+                                        "RelationshipSatisfaction", "WorkLifeBalance"] if c in df.columns]
+                if sat_cols:
+                    means = df.groupby("Attrition_Flag")[sat_cols].mean().T.reset_index()
+                    means.columns = ["Indikator", "Stay", "Resign"]
+                    fig = px.bar(
+                        means.melt(id_vars="Indikator", var_name="Status", value_name="Skor"),
+                        x="Indikator", y="Skor", color="Status", barmode="group",
+                        title="Rata-rata Indikator Kepuasan: Stay vs Resign",
+                        color_discrete_map={"Stay": "#3498db", "Resign": "#e74c3c"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with tab4:
+            num_df = df.select_dtypes(include="number")
+            if "Attrition_Flag" in num_df.columns:
+                corr = num_df.corr()["Attrition_Flag"].drop("Attrition_Flag").sort_values(
+                    key=abs, ascending=False
+                ).head(15)
+                fig = px.bar(
+                    x=corr.values, y=corr.index, orientation="h",
+                    title="Top 15 Korelasi Fitur dengan Attrition",
+                    color=corr.values,
+                    color_continuous_scale=["#3498db", "#ecf0f1", "#e74c3c"],
+                )
+                fig.update_layout(xaxis_title="Korelasi", yaxis_title="", showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### Ringkasan Insight Utama")
+        insight_table = pd.DataFrame([
+            ["OverTime / Is_Overworked", "Karyawan yang lembur resign ~3x lebih banyak (30.5% vs 10.4%)"],
+            ["Job Level", "Entry-level (Level 1) paling rentan: attrition 26.3%"],
+            ["Job Role", "Sales Representative tertinggi (39.8%), Research Director terendah (2.5%)"],
+            ["Monthly Income", "Karyawan resign berpenghasilan rata-rata 29% lebih rendah"],
+            ["Status Pernikahan", "Single: 25.5% vs menikah: 11.7%"],
+            ["Generasi", "Millennial paling rentan (20.2%)"],
+            ["Overall Satisfaction", "Stay: 2.76 vs Resign: 2.51"],
+            ["Departemen", "Sales paling rentan (20.6%), R&D paling stabil (13.8%)"],
+            ["Pengalaman Kerja", "Karyawan baru & tahun jabatan rendah lebih berisiko"],
+            ["Business Travel", "Sering perjalanan bisnis meningkatkan risiko resign"],
+        ], columns=["Faktor", "Temuan"])
+        st.table(insight_table)
+
+# ============================================================
+# 3.6 Halaman: Tentang
+# ============================================================
+elif page.endswith("Tentang"):
+    st.title("Tentang AttritionGuard")
+
+    st.markdown("""
+    **AttritionGuard** adalah sistem prediksi risiko attrition (resign) karyawan
+    yang dibangun di atas dataset **IBM HR Analytics Employee Attrition & Performance**
+    (1.470 baris data karyawan).
+
+    Aplikasi ini dikembangkan secara bertahap oleh tim, terdiri dari:
+    - **Data Preparation** — Zahra Daniah (cleaning, preprocessing, feature engineering)
+    - **Exploratory Data Analysis** — Nailah Fauziyyah (analisis & insight)
+    - **Machine Learning** — Hafizatul Khairani (pemilihan, training, evaluasi, tuning model)
+    - **Deployment** — Nabila Nur Aini (aplikasi web Streamlit ini)
+    """)
 
     st.divider()
-    st.markdown("### \U0001F511 Faktor Utama Pendorong Attrition")
-    st.markdown(
-        """
-| # | Faktor | Temuan |
-|---|--------|--------|
-| 1 | **OverTime** | Karyawan lembur resign ~3x lebih banyak (30.5% vs 10.4%) |
-| 2 | **Job Level** | Entry-level (Level 1) paling rentan: 26.3% |
-| 3 | **Job Role** | Sales Representative tertinggi (39.8%) |
-| 4 | **Monthly Income** | Karyawan resign berpenghasilan ~29% lebih rendah |
-| 5 | **Status Pernikahan** | Single 25.5% vs menikah 11.7% |
-| 6 | **Generasi** | Millennial paling rentan (20.2%) |
-| 7 | **Business Travel** | Sering dinas meningkatkan risiko resign |
-"""
+    st.markdown("#### Informasi Model")
+
+    if art["model"] is not None:
+        model_name = type(art["model"]).__name__
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Algoritma", model_name)
+        c2.metric("Jumlah Fitur", len(art["feature_columns"]) if art["feature_columns"] else "-")
+        c3.metric("Threshold Optimal", f"{art['threshold']:.2f}")
+
+        st.markdown(f"""
+        **Mengapa threshold {art['threshold']:.2f}, bukan 0.5?**
+
+        Threshold default (0.5) menghasilkan recall yang rendah — banyak karyawan yang
+        sebenarnya akan resign tidak tertangkap oleh model. Threshold diturunkan ke
+        **{art['threshold']:.2f}** untuk memaksimalkan **recall ≥ 70%**, dengan
+        konsekuensi jumlah *false alarm* (karyawan ditandai berisiko padahal sebenarnya
+        bertahan) menjadi lebih banyak.
+
+        Trade-off ini diambil secara sengaja: dalam konteks retensi karyawan,
+        **biaya kehilangan talenta (false negative) jauh lebih mahal** dibanding
+        biaya melakukan intervensi pencegahan ke karyawan yang sebenarnya tidak akan resign
+        (false positive).
+        """)
+    else:
+        st.warning("Model belum dimuat.")
+
+    st.divider()
+    st.markdown("#### Performa Model (Hasil Evaluasi pada Test Set)")
+    perf_table = pd.DataFrame([
+        ["Logistic Regression", 0.8435, 0.5135, 0.4043, 0.4524, 0.8022],
+        ["XGBoost", 0.8673, 0.7000, 0.2979, 0.4179, 0.7655],
+        ["Decision Tree", 0.7279, 0.2676, 0.4043, 0.3220, 0.5969],
+        ["Random Forest", 0.8299, 0.4348, 0.2128, 0.2857, 0.7391],
+    ], columns=["Model", "Accuracy", "Precision", "Recall", "F1-Score", "AUC-ROC"])
+    st.dataframe(perf_table, use_container_width=True, hide_index=True)
+    st.caption(
+        "Logistic Regression dipilih sebagai model produksi karena F1-Score dan AUC-ROC "
+        "tertinggi serta paling stabil pada cross-validation (mean F1 = 0.894, std = 0.020)."
     )
-    st.markdown("### \U0001F4A1 Rekomendasi Strategis")
-    st.markdown(
-        "1. **Batasi OverTime** dan pantau beban kerja.\n"
-        "2. **Program retensi entry-level** (mentoring, jalur karier, kompensasi).\n"
-        "3. **Perhatikan role bertekanan tinggi** seperti Sales Representative.\n"
-        "4. **Review kompensasi** untuk menutup gap gaji.\n"
-        "5. **Engagement untuk karyawan muda/single**."
-    )
 
+    st.divider()
+    st.markdown("#### Batasan & Disclaimer")
+    st.warning("""
+    - Model dilatih pada data historis IBM HR Analytics dan **belum tentu merepresentasikan**
+      kondisi perusahaan lain secara langsung.
+    - Recall model (~72% pada threshold optimal) berarti **sekitar 1 dari 4 karyawan**
+      yang akan resign tidak terdeteksi oleh sistem.
+    - Precision yang moderat berarti **akan ada false alarm** — tidak semua karyawan yang
+      ditandai berisiko benar-benar akan resign.
+    - **Prediksi ini adalah alat bantu pendukung keputusan**, bukan keputusan final.
+      Keputusan HR (mutasi, kenaikan gaji, dsb.) tetap harus mempertimbangkan konteks
+      manusia dan bukti tambahan di luar model.
+    """)
 
-# ----------------------------------------------------------------------------
-# HALAMAN: TENTANG
-# ----------------------------------------------------------------------------
-else:
-    st.title("\u2139\uFE0F Tentang AttritionGuard")
-    st.markdown(
-        """
-**AttritionGuard** adalah sistem prediksi risiko attrition karyawan berbasis Machine Learning,
-dibangun untuk **GWE 2026 Data Science Challenge**.
-
-**Pipeline:**
-1. Data Preparation \u2192 cleaning, encoding, feature engineering, scaling
-2. EDA \u2192 analisis faktor pendorong attrition
-3. Machine Learning \u2192 Logistic Regression, Decision Tree, Random Forest, XGBoost + SMOTE
-4. **Deployment (halaman ini)** \u2192 Streamlit
-
-**Fitur deployment:** prediksi individu, prediksi batch, dashboard EDA,
-penjelasan SHAP per prediksi, serta rekomendasi tindakan.
-
-**Tech stack:** Python, scikit-learn, XGBoost, SHAP, Pandas, Plotly, Streamlit.
-"""
-    )
-    st.caption("GWE 2026 Data Science Challenge | Grow With EDM Gen 7")
+    st.divider()
+    st.caption("AttritionGuard v1.0 — Dataset: IBM HR Analytics Employee Attrition & Performance (Kaggle)")
