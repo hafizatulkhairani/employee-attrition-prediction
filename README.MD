@@ -142,7 +142,7 @@ git pull
 
 ## 🌐 Link Deployment
 
-> 🔗 Coming soon...
+> 🔗(https://employee-attrition-prediction-rsakvewwnubzbsv9sdaxqf.streamlit.app/)
 
 ---
 
